@@ -284,6 +284,20 @@
   box-shadow: 0 0 0 2px rgb(196 244 107 / 8%);
 }
 
+.selection-bar select:disabled {
+  color: #78877d;
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.model-lock {
+  align-self: center;
+  padding-bottom: 10px;
+  color: #c4f46b;
+  font-size: 9px;
+  font-weight: 700;
+}
+
 .selection-bar option,
 .management-form option {
   color: #e5eee1;
@@ -436,6 +450,74 @@
 
 .chat-section > .demo-note {
   align-self: center;
+}
+
+.message-image {
+  display: block;
+  max-width: min(100%, 360px);
+  max-height: 320px;
+  margin-top: 9px;
+  border: 1px solid rgb(219 242 222 / 12%);
+  border-radius: 8px;
+  object-fit: contain;
+}
+
+.composer-image-preview {
+  position: relative;
+  grid-column: 1;
+  width: fit-content;
+  max-width: 100%;
+}
+
+.composer-image-preview img {
+  display: block;
+  max-width: min(100%, 120px);
+  max-height: 90px;
+  border: 1px solid rgb(219 242 222 / 15%);
+  border-radius: 7px;
+  object-fit: contain;
+}
+
+.composer-image-preview button {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid #26352b;
+  border-radius: 50%;
+  color: #f2d9d3;
+  background: #59382f;
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.image-file-input {
+  display: none;
+}
+
+.image-upload-button {
+  padding: 4px 7px;
+  border: 1px solid rgb(196 244 107 / 20%);
+  border-radius: 6px;
+  color: #c4f46b;
+  background: rgb(196 244 107 / 5%);
+  cursor: pointer;
+  font: inherit;
+  font-size: 8px;
+}
+
+.image-upload-button:hover:not(:disabled) {
+  background: rgb(196 244 107 / 11%);
+}
+
+.image-upload-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 .workspace-error {

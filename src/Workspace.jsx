@@ -49,12 +49,33 @@ function getMessageRole(message) {
 }
 
 function normalizeMessage(message, index = 0) {
+  const imageBase64 = message?.imageBase64 || message?.image_base64 || ''
+  const imageMimeType = message?.imageMimeType || message?.image_mime_type || ''
+  const imageUrl = message?.imageUrl || message?.image_url || ''
   return {
     ...message,
     id: getId(message, ['messageId']) || `message-${index}`,
     role: getMessageRole(message),
     content: getMessageContent(message),
+    imageSrc: imageUrl || (imageBase64 && imageMimeType
+      ? `data:${imageMimeType};base64,${imageBase64}`
+      : ''),
   }
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result !== 'string' || !reader.result.includes(',')) {
+        reject(new Error('The selected image could not be read.'))
+        return
+      }
+      resolve(reader.result.slice(reader.result.indexOf(',') + 1))
+    }
+    reader.onerror = () => reject(reader.error || new Error('The selected image could not be read.'))
+    reader.readAsDataURL(file)
+  })
 }
 
 function appendStreamToken(message, content, isThinking) {
@@ -141,9 +162,12 @@ export default function Workspace({ onLogout }) {
   const [hasMoreConversations, setHasMoreConversations] = useState(false)
   const [activeConversation, setActiveConversation] = useState(null)
   const [messages, setMessages] = useState([])
+  const [messageHistoryLoadedFor, setMessageHistoryLoadedFor] = useState('')
   const [messagePage, setMessagePage] = useState(0)
   const [hasMoreMessages, setHasMoreMessages] = useState(false)
   const [draft, setDraft] = useState('')
+  const [selectedImage, setSelectedImage] = useState(null)
+  const [imageLoading, setImageLoading] = useState(false)
   const [modelId, setModelId] = useState('')
   const [configId, setConfigId] = useState('')
   const [selectedProvider, setSelectedProvider] = useState(null)
@@ -187,11 +211,14 @@ export default function Workspace({ onLogout }) {
   const messageThreadRef = useRef(null)
   const shouldStickToBottomRef = useRef(true)
   const streamControllerRef = useRef(null)
+  const imageInputRef = useRef(null)
   const configProviderModelsRequestRef = useRef(0)
   const userCancelledStreamRef = useRef(false)
   const activeConversationIdRef = useRef('')
   const activeConversationId = getId(activeConversation, ['conversationId'])
   const retryContent = retryRequest?.conversationId === activeConversationId ? retryRequest.content : ''
+  const retryImage = retryRequest?.conversationId === activeConversationId ? retryRequest.image : null
+  const canRetry = Boolean(retryContent || retryImage)
   const displayName = user?.displayName || user?.name || user?.email || getDisplayNameFromToken(readAccessToken() || '')
   const level = Math.floor(messages.length / 5) + 1
 
@@ -244,8 +271,8 @@ export default function Workspace({ onLogout }) {
       const body = await apiGet(`conversations/${encodeURIComponent(conversationId)}/messages?${params.toString()}`)
       const items = getItems(body, ['messages'])
       const normalized = items.map((item, index) => normalizeMessage(item, `${page}-${index}`))
-        .filter((item) => item.content)
       setMessages((current) => append ? [...current, ...normalized] : normalized)
+      if (!append) setMessageHistoryLoadedFor(conversationId)
       setMessagePage(page)
       const pagination = body?.page || body?.data?.page
       setHasMoreMessages(
@@ -263,6 +290,10 @@ export default function Workspace({ onLogout }) {
     const details = await apiGet(`conversations/${encodeURIComponent(id)}`)
     const entity = getEntity(details, ['conversation'])
     setActiveConversation(entity)
+    setMessages([])
+    setMessageHistoryLoadedFor('')
+    setHasMoreMessages(false)
+    setMessagePage(0)
     setModelId(String(entity.modelId || entity.model?.id || ''))
     setConfigId(String(entity.providerConfigId || entity.providerConfig?.id || ''))
     await loadMessages(id)
@@ -326,6 +357,8 @@ export default function Workspace({ onLogout }) {
       if (!conversationId) {
         setActiveConversation(null)
         setMessages([])
+        setMessageHistoryLoadedFor('')
+        setSelectedImage(null)
         setResourceError('conversationDetail', null)
         return
       }
@@ -349,6 +382,20 @@ export default function Workspace({ onLogout }) {
       : models
   }, [configs, configId, models])
   const selectedCatalogModel = models.find((model) => getId(model, ['modelId']) === modelId)
+  const activeConversationModelId = String(activeConversation?.modelId || activeConversation?.model?.id || '')
+  const activeCatalogModel = models.find((model) => getId(model, ['modelId']) === activeConversationModelId)
+  const activeDetailModel = getId(selectedModel, ['modelId']) === activeConversationModelId ? selectedModel : null
+  const activeConversationModel = [activeConversation?.model, activeCatalogModel, activeDetailModel]
+    .find((model) => typeof model?.supportsVision === 'boolean')
+  const selectedDetailModel = getId(selectedModel, ['modelId']) === modelId ? selectedModel : null
+  const selectedVisionModel = [selectedCatalogModel, selectedDetailModel]
+    .find((model) => typeof model?.supportsVision === 'boolean')
+  const visionModel = activeConversation ? activeConversationModel : selectedVisionModel
+  const supportsVision = visionModel?.supportsVision === true
+  const conversationHasMessages = messages.length > 0 || hasMoreMessages
+  const conversationSelectionLocked = Boolean(activeConversation && (
+    conversationHasMessages || messageHistoryLoadedFor !== activeConversationId
+  ))
   const selectedModelIsOffline = selectedCatalogModel?.isOffline === true
     || (getId(selectedModel, ['modelId']) === modelId && selectedModel?.isOffline === true)
   const configProviderIsOffline = configProviderModels.length > 0
@@ -423,7 +470,10 @@ export default function Workspace({ onLogout }) {
       if (!id) throw new Error('Conversation creation succeeded but the response did not include an ID.')
       setActiveConversation(entity)
       setMessages([])
+      setMessageHistoryLoadedFor(id)
       setMessagePage(0)
+      setHasMoreMessages(false)
+      setSelectedImage(null)
       setConversationTitle('')
       setNotice({ type: 'success', text: 'New conversation created.' })
       await loadConversations(0)
@@ -437,9 +487,9 @@ export default function Workspace({ onLogout }) {
     }
   }
 
-  async function streamMessage(content, isRetry = false) {
+  async function streamMessage(content, isRetry = false, image = null) {
     const conversationId = getId(activeConversation, ['conversationId'])
-    if (!content || !conversationId || pending || streamControllerRef.current) return
+    if ((!content && !image) || !conversationId || pending || streamControllerRef.current) return
 
     const assistantId = isRetry && streamingAssistantId
       ? streamingAssistantId
@@ -479,16 +529,26 @@ export default function Workspace({ onLogout }) {
       const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
       setMessages((current) => [
         ...current,
-        { id: `stream-user-${localId}`, role: 'user', content },
+        {
+          id: `stream-user-${localId}`,
+          role: 'user',
+          content,
+          ...(image ? {
+            imageBase64: image.base64,
+            imageMimeType: image.mimeType,
+            imageSrc: image.previewUrl,
+          } : {}),
+        },
         { id: assistantId, role: 'assistant', content: '', thinkingContent: '', usage: null, streamPrefix: '', streamPrefixHandled: false },
       ])
     }
 
     try {
       await apiStream(`conversations/${encodeURIComponent(conversationId)}/messages/stream`, {
-        content,
+        content: content || '',
         thinking: thinkingEnabled,
         internet: internetEnabled,
+        ...(image ? { imageBase64: image.base64, imageMimeType: image.mimeType } : {}),
       }, {
         signal: controller.signal,
         onEvent: (type, data) => {
@@ -541,11 +601,11 @@ export default function Workspace({ onLogout }) {
       }
       if (controller.signal.aborted) {
         if (userCancelledStreamRef.current && stillInConversation) {
-          setRetryRequest({ content, conversationId })
+          setRetryRequest({ content, image, conversationId })
           setNotice({ type: 'error', text: 'Response stopped. You can retry the request.' })
         }
       } else if (stillInConversation) {
-        setRetryRequest({ content, conversationId })
+        setRetryRequest({ content, image, conversationId })
         setNotice({ type: 'error', text: getApiError(error) })
       }
     } finally {
@@ -559,7 +619,38 @@ export default function Workspace({ onLogout }) {
 
   function sendMessage(event) {
     event.preventDefault()
-    streamMessage(draft.trim())
+    const content = draft.trim()
+    if (!content && !selectedImage) return
+    const image = selectedImage
+    setSelectedImage(null)
+    if (imageInputRef.current) imageInputRef.current.value = ''
+    streamMessage(content, false, image)
+  }
+
+  async function selectImage(event) {
+    const file = event.currentTarget.files?.[0]
+    event.currentTarget.value = ''
+    if (!file) return
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+      setNotice({ type: 'error', text: 'Choose a PNG, JPEG, or WebP image.' })
+      return
+    }
+
+    setImageLoading(true)
+    setNotice(null)
+    try {
+      const base64 = await fileToBase64(file)
+      setSelectedImage({
+        base64,
+        mimeType: file.type,
+        name: file.name,
+        previewUrl: `data:${file.type};base64,${base64}`,
+      })
+    } catch (error) {
+      setNotice({ type: 'error', text: getApiError(error) })
+    } finally {
+      setImageLoading(false)
+    }
   }
 
   function cancelStream() {
@@ -895,7 +986,7 @@ export default function Workspace({ onLogout }) {
 
   async function applyConversationSelection() {
     const id = getId(activeConversation, ['conversationId'])
-    if (!id || !modelId || (!configId && !selectedModelIsOffline)) return
+    if (!id || conversationSelectionLocked || !modelId || (!configId && !selectedModelIsOffline)) return
     setBusy(true)
     try {
       const body = await apiPatch(`conversations/${encodeURIComponent(id)}`, {
@@ -921,6 +1012,8 @@ export default function Workspace({ onLogout }) {
       if (getId(activeConversation, ['conversationId']) === id) {
         setActiveConversation(null)
         setMessages([])
+        setMessageHistoryLoadedFor('')
+        setSelectedImage(null)
         window.history.replaceState({}, '', '/chat')
       }
       setNotice({ type: 'success', text: 'Conversation deleted.' })
@@ -1025,7 +1118,10 @@ export default function Workspace({ onLogout }) {
         <button className="new-chat-button" type="button" onClick={() => {
           setActiveConversation(null)
           setMessages([])
+          setMessageHistoryLoadedFor('')
+          setSelectedImage(null)
           setMessagePage(0)
+          setHasMoreMessages(false)
           setModelId('')
           setConfigId('')
           window.history.pushState({}, '', '/chat')
@@ -1090,7 +1186,7 @@ export default function Workspace({ onLogout }) {
 
         {notice && <div className={`workspace-notice ${notice.type}`} role={notice.type === 'error' ? 'alert' : 'status'}>
           <span>{notice.text}</span>
-          {retryContent && <button className="stream-retry-button" type="button" onClick={() => streamMessage(retryContent, true)} disabled={pending}>Retry</button>}
+          {canRetry && <button className="stream-retry-button" type="button" onClick={() => streamMessage(retryContent, true, retryImage)} disabled={pending}>Retry</button>}
           <button type="button" onClick={() => setNotice(null)} aria-label="Dismiss notification">×</button>
         </div>}
 
@@ -1098,7 +1194,7 @@ export default function Workspace({ onLogout }) {
           <div className="workspace-content chat-section">
             <section className="selection-bar" aria-label="Conversation model configuration">
               <label>MODEL
-                <select value={modelId} onChange={(event) => setModelId(event.target.value)}>
+                <select value={modelId} onChange={(event) => setModelId(event.target.value)} disabled={conversationSelectionLocked}>
                   <option value="">Choose a model</option>
                   {filteredModels.map((model) => <option value={getId(model, ['modelId'])} key={getId(model, ['modelId'])}>{getEntityName(model, 'Model')}</option>)}
                 </select>
@@ -1109,12 +1205,14 @@ export default function Workspace({ onLogout }) {
                   setModelId('')
                   setSelectedModel(null)
                   setSelectedConfig(null)
-                }}>
+                }} disabled={conversationSelectionLocked}>
                   <option value="">Choose a configuration</option>
                   {configs.map((config) => <option value={getId(config, ['configId', 'providerConfigId'])} key={getId(config, ['configId', 'providerConfigId'])}>{getEntityName(config, 'Configuration')}</option>)}
                 </select>
               </label>
-              {activeConversation ? <button className="secondary-button" type="button" onClick={applyConversationSelection} disabled={busy || !modelId || (!configId && !selectedModelIsOffline)}>Apply to conversation</button> : null}
+              {activeConversation && conversationHasMessages
+                ? <span className="model-lock" title="The model cannot be changed after a conversation has messages">🔒 Model locked</span>
+                : activeConversation ? <button className="secondary-button" type="button" onClick={applyConversationSelection} disabled={busy || conversationSelectionLocked || !modelId || (!configId && !selectedModelIsOffline)}>Apply to conversation</button> : null}
               {selectedModel && getId(selectedModel, ['modelId']) === modelId && <span className="model-context">Context {selectedModel.contextWindow ? Number(selectedModel.contextWindow).toLocaleString() : '—'}</span>}
             </section>
             {renderError('modelsByProvider')}{renderError('modelDetail')}
@@ -1138,6 +1236,8 @@ export default function Workspace({ onLogout }) {
                   <button className="secondary-button" type="button" onClick={() => {
                     setActiveConversation(null)
                     setMessages([])
+                    setMessageHistoryLoadedFor('')
+                    setSelectedImage(null)
                     setMessagePage(0)
                     window.history.pushState({}, '', '/chat')
                   }}>New conversation</button>
@@ -1169,6 +1269,9 @@ export default function Workspace({ onLogout }) {
                             {String(message.content ?? '')}
                           </ReactMarkdown>
                         </div>
+                        {message.imageSrc && (
+                          <img className="message-image" src={message.imageSrc} alt="Image attached to this message" />
+                        )}
                         {message.thinkingContent && (
                           <details className="message-thinking">
                             <summary>Reasoning</summary>
@@ -1198,8 +1301,32 @@ export default function Workspace({ onLogout }) {
                       event.currentTarget.form.requestSubmit()
                     }
                   }} placeholder="Message your AI..." aria-label="Message your AI" rows={1} maxLength={2000} />
+                  {selectedImage && (
+                    <div className="composer-image-preview">
+                      <img src={selectedImage.previewUrl} alt={`Selected image: ${selectedImage.name}`} />
+                      <button type="button" onClick={() => {
+                        setSelectedImage(null)
+                        if (imageInputRef.current) imageInputRef.current.value = ''
+                      }} aria-label="Remove selected image">×</button>
+                    </div>
+                  )}
                   <div className="composer-tools">
                     <span><kbd>↵</kbd> send <span className="composer-divider">·</span><kbd>⇧ ↵</kbd> new line</span>
+                    {supportsVision && (
+                      <>
+                        <input
+                          ref={imageInputRef}
+                          className="image-file-input"
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp"
+                          onChange={selectImage}
+                          aria-label="Choose an image"
+                        />
+                        <button className="image-upload-button" type="button" onClick={() => imageInputRef.current?.click()} disabled={pending || imageLoading}>
+                          {imageLoading ? 'Reading image…' : '🖼️ Image'}
+                        </button>
+                      </>
+                    )}
                     <label className="thinking-toggle" title="Enable or disable model reasoning for this conversation">
                       <input type="checkbox" checked={thinkingEnabled} onChange={(event) => updateThinkingPreference(event.target.checked)} />
                       <span>💡 Thinking</span>
@@ -1212,7 +1339,7 @@ export default function Workspace({ onLogout }) {
                   </div>
                   {pending
                     ? <button type="button" className="send-button stop-button" onClick={cancelStream} aria-label="Stop response">■</button>
-                    : <button type="submit" className="send-button" disabled={!draft.trim() || busy} aria-label="Send message">↑</button>}
+                    : <button type="submit" className="send-button" disabled={(!draft.trim() && !selectedImage) || busy || imageLoading} aria-label="Send message">↑</button>}
                 </form>
                 <p className="demo-note"><span>✦</span> POWERED BY YOUR SELECTED MODEL <span>✦</span></p>
               </>
