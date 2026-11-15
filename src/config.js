@@ -1,7 +1,5 @@
-const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL
+const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim()
+const hostname = window.location.hostname
+const defaultApiBaseUrl = `${window.location.protocol}//${hostname}:8080`
 
-if (!configuredApiBaseUrl) {
-  throw new Error('VITE_API_BASE_URL is not configured. Set it in the project .env file.')
-}
-
-export const API_BASE_URL = configuredApiBaseUrl.replace(/\/+$/, '')
+export const API_BASE_URL = (configuredApiBaseUrl || defaultApiBaseUrl).replace(/\/+$/, '')

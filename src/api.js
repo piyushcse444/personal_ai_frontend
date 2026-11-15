@@ -192,6 +192,138 @@ export async function apiRequest(path, options = {}, retry = true) {
   return body
 }
 
+async function consumeEventStream(response, onEvent, signal) {
+  if (!response.body) throw new Error('The server did not provide a readable response stream.')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let eventType = ''
+  let dataLines = []
+  let receivedDoneEvent = false
+
+  function dispatchEvent() {
+    if (!dataLines.length) {
+      eventType = ''
+      return
+    }
+
+    const type = eventType || 'message'
+    let data
+    try {
+      data = JSON.parse(dataLines.join('\n'))
+    } catch (error) {
+      throw new Error(`The server sent invalid data in its "${type}" event. ${error.message}`)
+    }
+
+    if (type === 'done') receivedDoneEvent = true
+    onEvent(type, data)
+    eventType = ''
+    dataLines = []
+  }
+
+  function processLine(rawLine) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
+    if (!line) {
+      dispatchEvent()
+      return
+    }
+    if (line.startsWith(':')) return
+
+    const separator = line.indexOf(':')
+    const field = separator < 0 ? line : line.slice(0, separator)
+    const value = separator < 0 ? '' : line.slice(separator + 1).replace(/^ /, '')
+    if (field === 'event') eventType = value
+    else if (field === 'data') dataLines.push(value)
+  }
+
+  try {
+    readLoop: while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      let newline
+      while ((newline = buffer.indexOf('\n')) !== -1) {
+        processLine(buffer.slice(0, newline))
+        buffer = buffer.slice(newline + 1)
+        if (receivedDoneEvent) {
+          try {
+            await reader.cancel()
+          } catch {
+            // The completion event is final; cancellation only closes the transport.
+          }
+          break readLoop
+        }
+      }
+    }
+
+    if (!receivedDoneEvent) {
+      buffer += decoder.decode()
+      if (buffer) processLine(buffer)
+      dispatchEvent()
+    }
+  } catch (error) {
+    try {
+      await reader.cancel(error)
+    } catch {
+      // Preserve the stream error; cancellation is only best-effort cleanup.
+    }
+    if (signal?.aborted || error instanceof ApiError) throw error
+    throw new Error(`The AI response stream was interrupted. ${error.message}`)
+  } finally {
+    reader.releaseLock()
+  }
+
+  if (!receivedDoneEvent) {
+    throw new Error('The AI response stream ended before the server sent a completion event.')
+  }
+}
+
+export async function apiStream(path, payload, { signal, onEvent = () => {} } = {}, retry = true) {
+  const accessToken = readAccessToken()
+  const headers = new Headers({
+    Accept: 'text/event-stream',
+    'Content-Type': 'application/json',
+  })
+  if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`)
+
+  let response
+  try {
+    response = await fetch(apiUrl(path), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      credentials: 'same-origin',
+      signal,
+    })
+  } catch (error) {
+    if (signal?.aborted) throw error
+    throw new Error(
+      `The browser could not complete POST ${apiUrl(path)}. Check that the backend is running and its CORS policy allows origin ${window.location.origin}, method POST, and headers Authorization and Content-Type. ${error.message}`,
+    )
+  }
+
+  if (response.status === 401 && retry && !path.replace(/^\/+/, '').startsWith('auth/')) {
+    try {
+      await refreshAccessToken()
+      return apiStream(path, payload, { signal, onEvent }, false)
+    } catch (error) {
+      if (signal?.aborted) throw error
+      clearTokens()
+      window.dispatchEvent(new Event('personAi.sessionExpired'))
+      throw new ApiError(`Your session expired. Sign in again. ${error.message}`, 401)
+    }
+  }
+
+  if (!response.ok) {
+    const body = await readResponse(response)
+    throw new ApiError(messageFromBody(body, `Request failed (HTTP ${response.status}).`), response.status, body)
+  }
+
+  await consumeEventStream(response, onEvent, signal)
+}
+
 export function apiGet(path) {
   return apiRequest(path)
 }
