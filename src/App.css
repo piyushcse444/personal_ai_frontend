@@ -1384,34 +1384,6 @@
   color: #718077;
 }
 
-.composer-tools {
-  display: flex;
-  flex-wrap: wrap;
-  grid-column: 1;
-  align-items: center;
-  gap: 8px;
-  color: #738178;
-  font-size: 8px;
-}
-
-.composer-tools kbd {
-  padding: 2px 4px;
-  border: 1px solid rgb(220 241 216 / 13%);
-  border-radius: 4px;
-  color: #9aa89d;
-  background: rgb(220 241 216 / 4%);
-  font: inherit;
-  font-size: 8px;
-}
-
-.composer-divider {
-  color: #526158;
-}
-
-.composer-count {
-  margin-left: auto;
-}
-
 .send-button {
   display: grid;
   width: 37px;
@@ -1676,14 +1648,6 @@
 
   .chat-composer textarea {
     font-size: 11px;
-  }
-
-  .composer-tools {
-    font-size: 7px;
-  }
-
-  .composer-tools kbd {
-    font-size: 7px;
   }
 
   .send-button {

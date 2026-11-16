@@ -7,6 +7,7 @@ import {
   apiGet,
   apiPatch,
   apiPost,
+  apiRequest,
   apiStream,
   clearTokens,
   getDisplayNameFromToken,
@@ -37,6 +38,21 @@ function readInternetPreference() {
   } catch {
     return true
   }
+}
+
+function isChatModel(model) {
+  return !model?.modelType || String(model.modelType).toUpperCase() === 'CHAT'
+}
+
+function getTranscriptionError(error) {
+  if (error instanceof ApiError) {
+    if (error.status === 429) return 'Another transcription is in progress. Please try again later.'
+    if (error.status === 503) return 'Audio service temporarily unavailable.'
+    if (error.status === 507) return 'Not enough GPU memory for audio transcription.'
+    if (error.status === 400) return 'Please select a valid speech-to-text model and try again.'
+    if (error.status >= 500) return 'Failed to transcribe audio, please try again.'
+  }
+  return getApiError(error)
 }
 
 function getId(item, keys = []) {
@@ -119,6 +135,36 @@ function getConversationIdFromPath(pathname) {
   }
 }
 
+function groupConversationsByModel(conversations) {
+  const groups = new Map()
+
+  conversations.forEach((conversation) => {
+    const model = conversation?.model || {}
+    const modelName = model.modelName || ''
+    const key = modelName || model.id || conversation.modelId || 'unknown-model'
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        displayName: model.displayName || modelName || 'Unknown model',
+        supportsVision: Boolean(model.supportsVision),
+        conversations: [],
+      })
+    }
+    groups.get(key).conversations.push(conversation)
+  })
+
+  return Array.from(groups.values(), (group) => ({
+    ...group,
+    conversations: group.conversations.sort((first, second) => {
+      const firstUpdatedAt = Date.parse(first.updatedAt || '')
+      const secondUpdatedAt = Date.parse(second.updatedAt || '')
+      if (!Number.isFinite(firstUpdatedAt)) return Number.isFinite(secondUpdatedAt) ? 1 : 0
+      if (!Number.isFinite(secondUpdatedAt)) return -1
+      return secondUpdatedAt - firstUpdatedAt
+    }),
+  }))
+}
+
 function Icon({ children }) {
   return <span className="workspace-icon" aria-hidden="true">{children}</span>
 }
@@ -151,8 +197,17 @@ export default function Workspace({ onLogout }) {
   const [user, setUser] = useState(null)
   const [providers, setProviders] = useState([])
   const [models, setModels] = useState([])
+  const [asrModels, setAsrModels] = useState([])
+  const [asrModelsLoading, setAsrModelsLoading] = useState(false)
+  const [isAsrModelDialogOpen, setIsAsrModelDialogOpen] = useState(false)
+  const [isRecording, setIsRecording] = useState(false)
+  const [isStartingRecording, setIsStartingRecording] = useState(false)
+  const [isTranscribing, setIsTranscribing] = useState(false)
+  const [recordingSeconds, setRecordingSeconds] = useState(0)
+  const [transcriptionError, setTranscriptionError] = useState('')
   const [configs, setConfigs] = useState([])
   const [conversations, setConversations] = useState([])
+  const [expandedModelGroups, setExpandedModelGroups] = useState({})
   const [resourceErrors, setResourceErrors] = useState({})
   const [notice, setNotice] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -166,8 +221,10 @@ export default function Workspace({ onLogout }) {
   const [messagePage, setMessagePage] = useState(0)
   const [hasMoreMessages, setHasMoreMessages] = useState(false)
   const [draft, setDraft] = useState('')
+  const [isComposerExpanded, setIsComposerExpanded] = useState(false)
   const [selectedImage, setSelectedImage] = useState(null)
   const [imageLoading, setImageLoading] = useState(false)
+  const [isAttachmentMenuOpen, setIsAttachmentMenuOpen] = useState(false)
   const [modelId, setModelId] = useState('')
   const [configId, setConfigId] = useState('')
   const [selectedProvider, setSelectedProvider] = useState(null)
@@ -207,11 +264,23 @@ export default function Workspace({ onLogout }) {
   const [streamingAssistantId, setStreamingAssistantId] = useState('')
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
+  const [isOfflineModelModalOpen, setIsOfflineModelModalOpen] = useState(false)
+  const [offlineModels, setOfflineModels] = useState([])
+  const [offlineModelsLoading, setOfflineModelsLoading] = useState(false)
+  const [offlineModelError, setOfflineModelError] = useState('')
+  const [offlineModelNotice, setOfflineModelNotice] = useState('')
+  const [unloadingModelId, setUnloadingModelId] = useState('')
   const composerRef = useRef(null)
+  const attachmentMenuRef = useRef(null)
   const messageThreadRef = useRef(null)
   const shouldStickToBottomRef = useRef(true)
   const streamControllerRef = useRef(null)
   const imageInputRef = useRef(null)
+  const mediaRecorderRef = useRef(null)
+  const mediaStreamRef = useRef(null)
+  const recordedChunksRef = useRef([])
+  const recordingFailedRef = useRef(false)
+  const audioRecordingRequestRef = useRef(0)
   const configProviderModelsRequestRef = useRef(0)
   const userCancelledStreamRef = useRef(false)
   const activeConversationIdRef = useRef('')
@@ -228,6 +297,56 @@ export default function Workspace({ onLogout }) {
       thread.scrollTop = thread.scrollHeight
     }
   }, [messages, pending])
+
+  useEffect(() => {
+    if (!isRecording) return undefined
+    const timer = window.setInterval(() => {
+      setRecordingSeconds((seconds) => seconds + 1)
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [isRecording])
+
+  useEffect(() => {
+    if (!isAttachmentMenuOpen) return undefined
+
+    function handleAttachmentMenuPointerDown(event) {
+      if (!attachmentMenuRef.current?.contains(event.target)) setIsAttachmentMenuOpen(false)
+    }
+
+    function handleAttachmentMenuKeyDown(event) {
+      if (event.key === 'Escape') setIsAttachmentMenuOpen(false)
+    }
+
+    document.addEventListener('pointerdown', handleAttachmentMenuPointerDown)
+    window.addEventListener('keydown', handleAttachmentMenuKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handleAttachmentMenuPointerDown)
+      window.removeEventListener('keydown', handleAttachmentMenuKeyDown)
+    }
+  }, [isAttachmentMenuOpen])
+
+  useLayoutEffect(() => {
+    const composer = composerRef.current
+    if (!composer) return
+
+    composer.style.height = 'auto'
+    const scrollHeight = composer.scrollHeight
+    const maxHeight = Number.parseFloat(window.getComputedStyle(composer).maxHeight)
+    const nextHeight = Number.isFinite(maxHeight) ? Math.min(scrollHeight, maxHeight) : scrollHeight
+    composer.style.height = `${nextHeight}px`
+    composer.style.overflowY = scrollHeight > nextHeight ? 'auto' : 'hidden'
+  }, [draft])
+
+  useEffect(() => () => {
+    audioRecordingRequestRef.current += 1
+    const recorder = mediaRecorderRef.current
+    if (recorder) {
+      recorder.ondataavailable = null
+      recorder.onstop = null
+      recorder.onerror = null
+    }
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop())
+  }, [])
 
   const setResourceError = useCallback((key, error) => {
     setResourceErrors((current) => ({ ...current, [key]: error ? getApiError(error) : '' }))
@@ -377,21 +496,25 @@ export default function Workspace({ onLogout }) {
   const filteredModels = useMemo(() => {
     const config = configs.find((item) => getId(item, ['configId', 'providerConfigId']) === configId)
     const providerId = config?.providerId || config?.provider?.id
+    const chatModels = models.filter(isChatModel)
     return providerId
-      ? models.filter((model) => String(model.providerId || model.provider?.id) === String(providerId))
-      : models
+      ? chatModels.filter((model) => String(model.providerId || model.provider?.id) === String(providerId))
+      : chatModels
   }, [configs, configId, models])
+  const conversationGroups = useMemo(() => groupConversationsByModel(conversations), [conversations])
   const selectedCatalogModel = models.find((model) => getId(model, ['modelId']) === modelId)
+  const selectedDetailModel = getId(selectedModel, ['modelId']) === modelId ? selectedModel : null
   const activeConversationModelId = String(activeConversation?.modelId || activeConversation?.model?.id || '')
   const activeCatalogModel = models.find((model) => getId(model, ['modelId']) === activeConversationModelId)
   const activeDetailModel = getId(selectedModel, ['modelId']) === activeConversationModelId ? selectedModel : null
   const activeConversationModel = [activeConversation?.model, activeCatalogModel, activeDetailModel]
     .find((model) => typeof model?.supportsVision === 'boolean')
-  const selectedDetailModel = getId(selectedModel, ['modelId']) === modelId ? selectedModel : null
   const selectedVisionModel = [selectedCatalogModel, selectedDetailModel]
     .find((model) => typeof model?.supportsVision === 'boolean')
   const visionModel = activeConversation ? activeConversationModel : selectedVisionModel
   const supportsVision = visionModel?.supportsVision === true
+  const selectedModelForChat = selectedDetailModel || selectedCatalogModel
+  const selectedModelIsChat = isChatModel(selectedModelForChat)
   const conversationHasMessages = messages.length > 0 || hasMoreMessages
   const conversationSelectionLocked = Boolean(activeConversation && (
     conversationHasMessages || messageHistoryLoadedFor !== activeConversationId
@@ -453,7 +576,11 @@ export default function Workspace({ onLogout }) {
 
   async function startConversation(event) {
     event.preventDefault()
-    if (!modelId || (!configId && !selectedModelIsOffline)) {
+    if (!modelId || !selectedModelIsChat) {
+      setNotice({ type: 'error', text: 'Choose a chat model to start a conversation.' })
+      return
+    }
+    if (!configId && !selectedModelIsOffline) {
       setNotice({ type: 'error', text: 'Choose a model and a provider configuration unless the model is offline.' })
       return
     }
@@ -462,7 +589,7 @@ export default function Workspace({ onLogout }) {
     try {
       const body = await apiPost('conversations', {
         modelId,
-        ...(configId ? { providerConfigId: configId } : {}),
+        ...(!selectedModelIsOffline && configId ? { providerConfigId: configId } : {}),
         ...(conversationTitle.trim() ? { title: conversationTitle.trim() } : {}),
       })
       const entity = getEntity(body, ['conversation'])
@@ -526,6 +653,7 @@ export default function Workspace({ onLogout }) {
       })
     } else {
       setDraft('')
+      setIsComposerExpanded(false)
       const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
       setMessages((current) => [
         ...current,
@@ -625,6 +753,161 @@ export default function Workspace({ onLogout }) {
     setSelectedImage(null)
     if (imageInputRef.current) imageInputRef.current.value = ''
     streamMessage(content, false, image)
+  }
+
+  function releaseRecordingStream() {
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop())
+    mediaStreamRef.current = null
+  }
+
+  async function startAudioRecording(asrModelId) {
+    if (isStartingRecording || isTranscribing || mediaRecorderRef.current) return
+    if (!asrModelId) {
+      setTranscriptionError('Select a speech-to-text model before recording.')
+      return
+    }
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setTranscriptionError('Microphone recording requires a secure connection and a supported browser.')
+      return
+    }
+
+    setTranscriptionError('')
+    setIsStartingRecording(true)
+    const requestId = audioRecordingRequestRef.current + 1
+    audioRecordingRequestRef.current = requestId
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      if (audioRecordingRequestRef.current !== requestId) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
+      mediaStreamRef.current = stream
+      const mimeTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/mp4']
+      const mimeType = typeof window.MediaRecorder.isTypeSupported === 'function'
+        ? mimeTypes.find((type) => window.MediaRecorder.isTypeSupported(type))
+        : ''
+      const recorder = new window.MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+      const modelIdForRecording = asrModelId
+      mediaRecorderRef.current = recorder
+      recordedChunksRef.current = []
+      recordingFailedRef.current = false
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) recordedChunksRef.current.push(event.data)
+      }
+      recorder.onerror = () => {
+        recordingFailedRef.current = true
+        setIsRecording(false)
+        mediaRecorderRef.current = null
+        recordedChunksRef.current = []
+        setTranscriptionError('Audio recording failed. Please try again.')
+        releaseRecordingStream()
+      }
+      recorder.onstop = async () => {
+        setIsRecording(false)
+        releaseRecordingStream()
+        mediaRecorderRef.current = null
+        if (recordingFailedRef.current) return
+
+        const chunks = recordedChunksRef.current
+        recordedChunksRef.current = []
+        const audioBlob = new Blob(chunks, { type: recorder.mimeType || chunks[0]?.type || 'audio/webm' })
+        if (!audioBlob.size) {
+          setTranscriptionError('No audio was recorded. Please try again.')
+          return
+        }
+
+        const extension = audioBlob.type.includes('ogg') ? 'ogg'
+          : audioBlob.type.includes('mp4') ? 'm4a'
+            : 'webm'
+        const formData = new FormData()
+        formData.append('audio', audioBlob, `recording.${extension}`)
+        formData.append('modelId', modelIdForRecording)
+        setIsTranscribing(true)
+        setTranscriptionError('')
+        try {
+          const result = await apiRequest('audio/transcribe', { method: 'POST', body: formData })
+          if (result?.success === false) throw new Error(result.message || 'Failed to transcribe audio, please try again.')
+          const transcription = typeof result?.transcription === 'string' ? result.transcription.trim() : ''
+          if (!transcription) throw new Error('No speech was detected. Try recording again.')
+          setDraft((current) => current.trim() ? `${current.trimEnd()}\n${transcription}` : transcription)
+          window.requestAnimationFrame(() => {
+            const composer = composerRef.current
+            if (!composer) return
+            if (composer.scrollHeight > 42) setIsComposerExpanded(true)
+            composer.focus()
+          })
+        } catch (error) {
+          setTranscriptionError(getTranscriptionError(error))
+        } finally {
+          setIsTranscribing(false)
+        }
+      }
+      recorder.start()
+      setRecordingSeconds(0)
+      setIsRecording(true)
+      setIsStartingRecording(false)
+    } catch (error) {
+      if (audioRecordingRequestRef.current !== requestId) return
+      releaseRecordingStream()
+      mediaRecorderRef.current = null
+      setIsStartingRecording(false)
+      const permissionError = error?.name === 'NotAllowedError' || error?.name === 'SecurityError'
+      const missingMicrophone = error?.name === 'NotFoundError'
+      setTranscriptionError(permissionError
+        ? 'Microphone access was denied. Allow microphone access in your browser and try again.'
+        : missingMicrophone
+          ? 'No microphone was found on this device.'
+          : getApiError(error))
+    }
+  }
+
+  function toggleAudioRecording() {
+    if (isRecording) {
+      const recorder = mediaRecorderRef.current
+      if (recorder && recorder.state !== 'inactive') recorder.stop()
+      return
+    }
+
+    if (isStartingRecording || isTranscribing) return
+    setTranscriptionError('')
+    setIsStartingRecording(true)
+    setAsrModelsLoading(true)
+    apiGet('models?type=ASR')
+      .then((body) => {
+        const availableModels = getItems(body, ['models'])
+          .filter((model) => String(model?.modelType || '').toUpperCase() === 'ASR')
+          .filter((model) => getId(model, ['modelId']))
+        setAsrModels(availableModels)
+        setResourceError('asrModels', null)
+
+        if (!availableModels.length) {
+          setTranscriptionError('No speech-to-text models are available.')
+          return
+        }
+
+        if (availableModels.length > 1) {
+          setIsAsrModelDialogOpen(true)
+          return
+        }
+
+        const onlyModelId = getId(availableModels[0], ['modelId'])
+        setIsStartingRecording(false)
+        startAudioRecording(onlyModelId)
+      })
+      .catch((error) => {
+        setTranscriptionError(getApiError(error))
+      })
+      .finally(() => {
+        setAsrModelsLoading(false)
+        setIsStartingRecording(false)
+      })
+  }
+
+  function chooseAsrModel(model) {
+    const asrModelId = getId(model, ['modelId'])
+    if (!asrModelId || isStartingRecording) return
+    setIsAsrModelDialogOpen(false)
+    startAudioRecording(asrModelId)
   }
 
   async function selectImage(event) {
@@ -986,15 +1269,15 @@ export default function Workspace({ onLogout }) {
 
   async function applyConversationSelection() {
     const id = getId(activeConversation, ['conversationId'])
-    if (!id || conversationSelectionLocked || !modelId || (!configId && !selectedModelIsOffline)) return
+    if (!id || conversationSelectionLocked || !modelId || !selectedModelIsChat || (!configId && !selectedModelIsOffline)) return
     setBusy(true)
     try {
       const body = await apiPatch(`conversations/${encodeURIComponent(id)}`, {
         modelId,
-        ...(configId ? { providerConfigId: configId } : {}),
+        providerConfigId: selectedModelIsOffline ? null : configId,
       })
       setActiveConversation(getEntity(body, ['conversation']))
-      setNotice({ type: 'success', text: configId ? 'Conversation model and provider updated.' : 'Conversation model updated.' })
+      setNotice({ type: 'success', text: configId && !selectedModelIsOffline ? 'Conversation model and provider updated.' : 'Conversation model updated.' })
     } catch (error) {
       setNotice({ type: 'error', text: getApiError(error) })
     } finally {
@@ -1095,6 +1378,59 @@ export default function Workspace({ onLogout }) {
     }
   }
 
+  async function loadOfflineModels() {
+    setOfflineModelsLoading(true)
+    setOfflineModelError('')
+    try {
+      const body = await apiGet('unsloth/models')
+      setOfflineModels(getItems(body, ['models']))
+      return true
+    } catch (error) {
+      setOfflineModelError(error instanceof ApiError && error.status < 500
+        ? getApiError(error)
+        : 'Cannot connect to Unsloth service. Please ensure the service is running.')
+      return false
+    } finally {
+      setOfflineModelsLoading(false)
+    }
+  }
+
+  function openOfflineModelModal() {
+    setIsMobileSidebarOpen(false)
+    setIsOfflineModelModalOpen(true)
+    setOfflineModelNotice('')
+    loadOfflineModels()
+  }
+
+  async function unloadOfflineModel(model) {
+    const modelId = String(model?.id || '')
+    if (!modelId || unloadingModelId) return
+    const confirmed = window.confirm(
+      'Are you sure you want to unload this model? This will free up VRAM but the model will need to reload for the next request.',
+    )
+    if (!confirmed) return
+
+    setUnloadingModelId(modelId)
+    setOfflineModelError('')
+    setOfflineModelNotice('')
+    try {
+      const body = await apiPost('unsloth/models/unload', { modelId })
+      const result = getEntity(body, ['result'])
+      if (result?.success === false) {
+        throw new Error(result.message || 'The service did not unload the model.')
+      }
+      setOfflineModelNotice('Model unloaded successfully')
+      await loadOfflineModels()
+    } catch (error) {
+      const detail = getApiError(error)
+      setOfflineModelError(error instanceof Error
+        ? `Failed to unload model. Please try again. ${detail}`
+        : 'Failed to unload model. Please try again.')
+    } finally {
+      setUnloadingModelId('')
+    }
+  }
+
   function renderError(key) {
     return resourceErrors[key] ? <p className="workspace-error" role="alert">{resourceErrors[key]}</p> : null
   }
@@ -1109,6 +1445,28 @@ export default function Workspace({ onLogout }) {
       streamControllerRef.current?.abort()
     }
   }, [activeConversationId])
+
+  useEffect(() => {
+    if (!isOfflineModelModalOpen) return undefined
+
+    function handleModalKeyDown(event) {
+      if (event.key === 'Escape' && !unloadingModelId) setIsOfflineModelModalOpen(false)
+    }
+
+    window.addEventListener('keydown', handleModalKeyDown)
+    return () => window.removeEventListener('keydown', handleModalKeyDown)
+  }, [isOfflineModelModalOpen, unloadingModelId])
+
+  useEffect(() => {
+    if (!isAsrModelDialogOpen) return undefined
+
+    function handleAsrDialogKeyDown(event) {
+      if (event.key === 'Escape' && !isStartingRecording) setIsAsrModelDialogOpen(false)
+    }
+
+    window.addEventListener('keydown', handleAsrDialogKeyDown)
+    return () => window.removeEventListener('keydown', handleAsrDialogKeyDown)
+  }, [isAsrModelDialogOpen, isStartingRecording])
 
   return (
     <main className="game-app workspace-app">
@@ -1132,6 +1490,7 @@ export default function Workspace({ onLogout }) {
           <button className={section === 'providers' ? 'active' : ''} type="button" onClick={() => showSection('providers')}><Icon>◈</Icon> Providers & models</button>
           <button className={section === 'configs' ? 'active' : ''} type="button" onClick={() => showSection('configs')}><Icon>⚙</Icon> My configurations</button>
           <button className={section === 'account' ? 'active' : ''} type="button" onClick={() => showSection('account')}><Icon>◎</Icon> Account</button>
+          <button type="button" onClick={openOfflineModelModal}><Icon>▣</Icon> Offline Model</button>
         </div>
         <div className="sidebar-section-title"><span>YOUR ADVENTURES</span><span>{conversations.length.toString().padStart(2, '0')}</span></div>
         {renderError('conversations')}
@@ -1143,31 +1502,61 @@ export default function Workspace({ onLogout }) {
           <button type="submit" aria-label="Search">⌕</button>
         </form>
         <nav className="chat-list" aria-label="Your conversations">
-          {conversations.map((conversation) => {
-            const id = getId(conversation, ['conversationId'])
+          {conversationGroups.map((group) => {
+            const isExpanded = expandedModelGroups[group.key] !== false
             return (
-              <div className={`conversation-nav-item ${id === activeConversationId ? 'selected' : ''}`} key={id}>
-                {editingConversationId === id ? (
-                  <form onSubmit={renameConversation}>
-                    <input aria-label="New conversation title" value={editingConversationTitle} onChange={(event) => setEditingConversationTitle(event.target.value)} />
-                    <button type="submit" disabled={busy} aria-label="Save title">✓</button>
-                    <button type="button" onClick={() => setEditingConversationId('')} aria-label="Cancel rename">×</button>
-                  </form>
-                ) : (
-                  <>
-                    <button className="conversation-open" type="button" onClick={() => openConversation(conversation)}>
-                      <span className="chat-list-icon">✳</span><span>{getEntityName(conversation, 'Conversation')}</span>
-                    </button>
-                    <button className="conversation-more" type="button" aria-label={`Options for ${getEntityName(conversation, 'conversation')}`} onClick={() => {
-                      setEditingConversationId(id)
-                      setEditingConversationTitle(getEntityName(conversation, ''))
-                    }}>···</button>
-                    <button className="conversation-delete" type="button" aria-label={`Delete ${getEntityName(conversation, 'conversation')}`} onClick={() => deleteConversation(conversation)}>×</button>
-                  </>
+              <section className="conversation-model-group" key={group.key}>
+                <button
+                  className="conversation-model-header"
+                  type="button"
+                  aria-expanded={isExpanded}
+                  onClick={() => setExpandedModelGroups((current) => ({
+                    ...current,
+                    [group.key]: !isExpanded,
+                  }))}
+                >
+                  <span className={`conversation-model-chevron ${isExpanded ? 'expanded' : ''}`} aria-hidden="true">▸</span>
+                  <span className="conversation-model-name">{group.displayName}</span>
+                  {group.supportsVision && <span className="conversation-model-vision">Vision</span>}
+                  <span className="conversation-model-count">{group.conversations.length}</span>
+                </button>
+                {isExpanded && (
+                  <div className="conversation-model-children">
+                    {group.conversations.map((conversation) => {
+                      const id = getId(conversation, ['conversationId'])
+                      return (
+                        <div className={`conversation-nav-item ${id === activeConversationId ? 'selected' : ''}`} key={id}>
+                          {editingConversationId === id ? (
+                            <form onSubmit={renameConversation}>
+                              <input aria-label="New conversation title" value={editingConversationTitle} onChange={(event) => setEditingConversationTitle(event.target.value)} />
+                              <button type="submit" disabled={busy} aria-label="Save title">✓</button>
+                              <button type="button" onClick={() => setEditingConversationId('')} aria-label="Cancel rename">×</button>
+                            </form>
+                          ) : (
+                            <>
+                              <button className="conversation-open" type="button" onClick={() => openConversation(conversation)}>
+                                <span className="chat-list-icon">✳</span><span>{getEntityName(conversation, 'Conversation')}</span>
+                              </button>
+                              <button className="conversation-more" type="button" aria-label={`Options for ${getEntityName(conversation, 'conversation')}`} onClick={() => {
+                                setEditingConversationId(id)
+                                setEditingConversationTitle(getEntityName(conversation, ''))
+                              }}>···</button>
+                              <button className="conversation-delete" type="button" aria-label={`Delete ${getEntityName(conversation, 'conversation')}`} onClick={() => deleteConversation(conversation)}>×</button>
+                            </>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
                 )}
-              </div>
+              </section>
             )
           })}
+          {conversations.length === 0 && !resourceErrors.conversations && (
+            <p className="conversation-list-empty">
+              {query.trim() ? 'No conversations match your search.' : 'No conversations yet. Start a new conversation to begin.'}
+            </p>
+          )}
         </nav>
         {hasMoreConversations && <button className="load-more-button" type="button" onClick={() => loadConversations(conversationPage + 1)} disabled={busy}>Load more</button>}
         <div className="sidebar-profile">
@@ -1194,12 +1583,20 @@ export default function Workspace({ onLogout }) {
           <div className="workspace-content chat-section">
             <section className="selection-bar" aria-label="Conversation model configuration">
               <label>MODEL
-                <select value={modelId} onChange={(event) => setModelId(event.target.value)} disabled={conversationSelectionLocked}>
+                <select value={modelId} onChange={(event) => {
+                  const nextModelId = event.target.value
+                  setModelId(nextModelId)
+                  const nextModel = models.find((model) => getId(model, ['modelId']) === nextModelId)
+                  if (nextModel?.isOffline) {
+                    setConfigId('')
+                    setSelectedConfig(null)
+                  }
+                }} disabled={conversationSelectionLocked}>
                   <option value="">Choose a model</option>
                   {filteredModels.map((model) => <option value={getId(model, ['modelId'])} key={getId(model, ['modelId'])}>{getEntityName(model, 'Model')}</option>)}
                 </select>
               </label>
-              <label>PROVIDER CONFIG{selectedModelIsOffline ? ' (OPTIONAL)' : ''}
+              {!selectedModelIsOffline && <label>PROVIDER CONFIG
                 <select value={configId} onChange={(event) => {
                   setConfigId(event.target.value)
                   setModelId('')
@@ -1209,10 +1606,10 @@ export default function Workspace({ onLogout }) {
                   <option value="">Choose a configuration</option>
                   {configs.map((config) => <option value={getId(config, ['configId', 'providerConfigId'])} key={getId(config, ['configId', 'providerConfigId'])}>{getEntityName(config, 'Configuration')}</option>)}
                 </select>
-              </label>
+              </label>}
               {activeConversation && conversationHasMessages
                 ? <span className="model-lock" title="The model cannot be changed after a conversation has messages">🔒 Model locked</span>
-                : activeConversation ? <button className="secondary-button" type="button" onClick={applyConversationSelection} disabled={busy || conversationSelectionLocked || !modelId || (!configId && !selectedModelIsOffline)}>Apply to conversation</button> : null}
+                : activeConversation ? <button className="secondary-button" type="button" onClick={applyConversationSelection} disabled={busy || conversationSelectionLocked || !modelId || !selectedModelIsChat || (!configId && !selectedModelIsOffline)}>Apply to conversation</button> : null}
               {selectedModel && getId(selectedModel, ['modelId']) === modelId && <span className="model-context">Context {selectedModel.contextWindow ? Number(selectedModel.contextWindow).toLocaleString() : '—'}</span>}
             </section>
             {renderError('modelsByProvider')}{renderError('modelDetail')}
@@ -1224,9 +1621,9 @@ export default function Workspace({ onLogout }) {
                 <p>Choose the model and provider configuration you want to use, then start a conversation.</p>
                 <form className="start-conversation-form" onSubmit={startConversation}>
                   <input value={conversationTitle} onChange={(event) => setConversationTitle(event.target.value)} placeholder="Conversation title (optional)" aria-label="Conversation title" maxLength={120} />
-                  <button className="workspace-primary-button" type="submit" disabled={busy || !modelId || (!configId && !selectedModelIsOffline)}>{busy ? 'Starting…' : 'Start conversation'} <span>↗</span></button>
+                  <button className="workspace-primary-button" type="submit" disabled={busy || !modelId || !selectedModelIsChat || (!configId && !selectedModelIsOffline)}>{busy ? 'Starting…' : 'Start conversation'} <span>↗</span></button>
                 </form>
-                {(!models.length || (!configs.length && !selectedModelIsOffline)) && <p className="setup-hint">Choose an available model and add a provider configuration if required. Offline models do not need one.</p>}
+                {(!filteredModels.length || (!configs.length && !selectedModelIsOffline)) && <p className="setup-hint">Choose an available chat model and add a provider configuration if required. Offline models do not need one.</p>}
                 {renderError('configs')}{renderError('models')}
               </section>
             ) : (
@@ -1295,12 +1692,114 @@ export default function Workspace({ onLogout }) {
                   {!messages.length && !resourceErrors.messages && <p className="setup-hint">This conversation is ready. Send the first message.</p>}
                 </section>
                 <form className="chat-composer" onSubmit={sendMessage}>
-                  <textarea ref={composerRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => {
-                    if (event.key === 'Enter' && !event.shiftKey) {
-                      event.preventDefault()
-                      event.currentTarget.form.requestSubmit()
-                    }
-                  }} placeholder="Message your AI..." aria-label="Message your AI" rows={1} maxLength={2000} />
+                  <div className={`chat-composer-row ${isComposerExpanded ? 'expanded' : ''}`}>
+                    <textarea ref={composerRef} value={draft} onChange={(event) => {
+                      const nextDraft = event.target.value
+                      setDraft(nextDraft)
+                      if (nextDraft && event.currentTarget.scrollHeight > 42) setIsComposerExpanded(true)
+                      else if (!nextDraft) setIsComposerExpanded(false)
+                    }} onKeyDown={(event) => {
+                      if (event.key === 'Enter' && !event.shiftKey) {
+                        event.preventDefault()
+                        event.currentTarget.form.requestSubmit()
+                      }
+                    }} placeholder="Message your AI..." aria-label="Message your AI" rows={1} maxLength={2000} />
+                    <div className="composer-controls">
+                    <div className="attachment-menu-wrap" ref={attachmentMenuRef}>
+                      <input
+                        ref={imageInputRef}
+                        className="image-file-input"
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        onChange={selectImage}
+                        aria-label="Choose an image"
+                      />
+                      <button
+                        className={`composer-icon-button attachment-button ${isAttachmentMenuOpen ? 'active' : ''}`}
+                        type="button"
+                        aria-label="Add attachments"
+                        aria-expanded={isAttachmentMenuOpen}
+                        title="Add attachments"
+                        onClick={() => setIsAttachmentMenuOpen((open) => !open)}
+                      >+</button>
+                      {isAttachmentMenuOpen && (
+                        <div className="attachment-menu" role="menu" aria-label="Attachments">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            disabled={!supportsVision || pending || imageLoading}
+                            title={!supportsVision ? 'Image uploads require a vision-capable model.' : undefined}
+                            onClick={() => {
+                              setIsAttachmentMenuOpen(false)
+                              if (supportsVision) imageInputRef.current?.click()
+                            }}
+                          >
+                            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                              <rect x="3.5" y="4" width="17" height="16" rx="3" stroke="currentColor" strokeWidth="1.7" />
+                              <circle cx="9" cy="10" r="1.7" stroke="currentColor" strokeWidth="1.5" />
+                              <path d="m5 17 4.5-4 3.2 2.7 2.5-2 3.8 3.3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                            <span className="attachment-menu-copy">
+                              <strong>Photos & files</strong>
+                              <small>{supportsVision ? 'Add an image to your message' : 'Requires a vision model'}</small>
+                            </span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      className={`composer-icon-button thinking-control ${thinkingEnabled ? 'active' : ''}`}
+                      type="button"
+                      role="switch"
+                      aria-checked={thinkingEnabled}
+                      aria-label={`Thinking ${thinkingEnabled ? 'on' : 'off'}`}
+                      title={`Thinking ${thinkingEnabled ? 'on' : 'off'}`}
+                      onClick={() => updateThinkingPreference(!thinkingEnabled)}
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M9 18h6m-5 3h4m-2-19a7 7 0 0 0-4 12.75c.6.43 1 1.06 1 1.75h6c0-.69.4-1.32 1-1.75A7 7 0 0 0 12 2Z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+                        <path className="thinking-rays" d="M12 5.5v3m-3.5 0 1.2 1.2m7.3-1.2-1.2 1.2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                      </svg>
+                    </button>
+                    <button
+                      className={`composer-icon-button internet-control ${internetEnabled ? 'active' : ''}`}
+                      type="button"
+                      role="switch"
+                      aria-checked={internetEnabled}
+                      aria-label={`Internet ${internetEnabled ? 'on' : 'off'}`}
+                      title={`Internet ${internetEnabled ? 'on' : 'off'}`}
+                      onClick={() => updateInternetPreference(!internetEnabled)}
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.7" />
+                        <path d="M3.5 12h17M12 3c2.2 2.4 3.3 5.4 3.3 9s-1.1 6.6-3.3 9c-2.2-2.4-3.3-5.4-3.3-9S9.8 5.4 12 3Z" stroke="currentColor" strokeWidth="1.5" />
+                      </svg>
+                    </button>
+                    <button
+                      className={`composer-icon-button microphone-button ${isRecording ? 'recording' : ''}`}
+                      type="button"
+                      onClick={toggleAudioRecording}
+                      disabled={pending || isStartingRecording || isTranscribing}
+                      aria-label={isRecording ? 'Stop recording and transcribe' : 'Record a voice message'}
+                      title={isRecording ? 'Stop recording and transcribe' : 'Record a voice message'}
+                    >
+                      {isRecording
+                        ? <>
+                          <span className="microphone-stop-icon" aria-hidden="true">×</span>
+                          <span className="recording-duration">
+                            {String(Math.floor(recordingSeconds / 60)).padStart(2, '0')}:{String(recordingSeconds % 60).padStart(2, '0')}
+                          </span>
+                        </>
+                        : <svg className="microphone-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                          <rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" strokeWidth="1.8" />
+                          <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-4 0h8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                        </svg>}
+                    </button>
+                    {pending
+                      ? <button type="button" className="send-button stop-button" onClick={cancelStream} aria-label="Stop response">■</button>
+                      : <button type="submit" className="send-button" disabled={(!draft.trim() && !selectedImage) || busy || imageLoading} aria-label="Send message">↑</button>}
+                    </div>
+                  </div>
                   {selectedImage && (
                     <div className="composer-image-preview">
                       <img src={selectedImage.previewUrl} alt={`Selected image: ${selectedImage.name}`} />
@@ -1310,36 +1809,12 @@ export default function Workspace({ onLogout }) {
                       }} aria-label="Remove selected image">×</button>
                     </div>
                   )}
-                  <div className="composer-tools">
-                    <span><kbd>↵</kbd> send <span className="composer-divider">·</span><kbd>⇧ ↵</kbd> new line</span>
-                    {supportsVision && (
-                      <>
-                        <input
-                          ref={imageInputRef}
-                          className="image-file-input"
-                          type="file"
-                          accept="image/png,image/jpeg,image/webp"
-                          onChange={selectImage}
-                          aria-label="Choose an image"
-                        />
-                        <button className="image-upload-button" type="button" onClick={() => imageInputRef.current?.click()} disabled={pending || imageLoading}>
-                          {imageLoading ? 'Reading image…' : '🖼️ Image'}
-                        </button>
-                      </>
-                    )}
-                    <label className="thinking-toggle" title="Enable or disable model reasoning for this conversation">
-                      <input type="checkbox" checked={thinkingEnabled} onChange={(event) => updateThinkingPreference(event.target.checked)} />
-                      <span>💡 Thinking</span>
-                    </label>
-                    <label className="thinking-toggle" title="Enable or disable internet and tool access for this conversation">
-                      <input type="checkbox" checked={internetEnabled} onChange={(event) => updateInternetPreference(event.target.checked)} />
-                      <span>🌐 Internet</span>
-                    </label>
-                    <span className="composer-count">{draft.length}/2000</span>
-                  </div>
-                  {pending
-                    ? <button type="button" className="send-button stop-button" onClick={cancelStream} aria-label="Stop response">■</button>
-                    : <button type="submit" className="send-button" disabled={(!draft.trim() && !selectedImage) || busy || imageLoading} aria-label="Send message">↑</button>}
+                  {(asrModelsLoading || isStartingRecording || isTranscribing) && (
+                    <span className="transcription-status" role="status">
+                      {asrModelsLoading ? 'Finding speech models…' : isTranscribing ? 'Transcribing…' : 'Starting microphone…'}
+                    </span>
+                  )}
+                  {transcriptionError && <p className="transcription-error" role="alert">{transcriptionError}</p>}
                 </form>
                 <p className="demo-note"><span>✦</span> POWERED BY YOUR SELECTED MODEL <span>✦</span></p>
               </>
@@ -1440,6 +1915,126 @@ export default function Workspace({ onLogout }) {
           </div>
         )}
       </section>
+      {isOfflineModelModalOpen && (
+        <div
+          className="offline-model-overlay"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !unloadingModelId) setIsOfflineModelModalOpen(false)
+          }}
+        >
+          <section
+            className="offline-model-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="offline-model-title"
+            aria-busy={offlineModelsLoading}
+          >
+            <header className="offline-model-header">
+              <div>
+                <span className="arena-kicker">UNSLOTH INFERENCE</span>
+                <h2 id="offline-model-title">Offline Model Management</h2>
+              </div>
+              <button
+                type="button"
+                className="offline-model-close"
+                aria-label="Close offline model management"
+                onClick={() => setIsOfflineModelModalOpen(false)}
+                disabled={Boolean(unloadingModelId)}
+              >×</button>
+            </header>
+            {offlineModelError && <p className="offline-model-feedback error" role="alert">{offlineModelError}</p>}
+            {offlineModelNotice && <p className="offline-model-feedback success" role="status">{offlineModelNotice}</p>}
+            <div className="offline-model-list" aria-live="polite">
+              {offlineModelsLoading
+                ? <p className="offline-model-empty">Loading model status…</p>
+                : offlineModels.length === 0 && !offlineModelError
+                  ? <p className="offline-model-empty">No Unsloth models found.</p>
+                  : offlineModels.map((model, index) => {
+                    const modelId = String(model?.id || '')
+                    const shortName = modelId.split('/').pop()?.replace(/-(?:uncensored|gguf).*$/i, '') || 'Unknown model'
+                    const loaded = model?.loaded === true || String(model?.statusValue || '').toLowerCase() === 'loaded'
+                    return (
+                      <article className="offline-model-card" key={modelId || `model-${index}`}>
+                        <div className="offline-model-card-details">
+                          <strong title={modelId || undefined}>{shortName}</strong>
+                          <span>{model?.quant || 'Quantization unavailable'}</span>
+                        </div>
+                        <span className={`offline-model-status ${loaded ? 'loaded' : 'unloaded'}`}>
+                          <i aria-hidden="true" /> {loaded ? 'Loaded' : 'Unloaded'}
+                        </span>
+                        {loaded && (
+                          <button
+                            className="offline-model-unload"
+                            type="button"
+                            onClick={() => unloadOfflineModel(model)}
+                            disabled={!modelId || offlineModelsLoading || Boolean(unloadingModelId)}
+                          >
+                            {unloadingModelId === modelId ? 'Unloading…' : 'Unload'}
+                          </button>
+                        )}
+                      </article>
+                    )
+                  })}
+            </div>
+            <footer className="offline-model-footer">
+              <button className="secondary-button" type="button" onClick={loadOfflineModels} disabled={offlineModelsLoading || Boolean(unloadingModelId)}>
+                {offlineModelsLoading ? 'Refreshing…' : 'Refresh'}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+      {isAsrModelDialogOpen && (
+        <div
+          className="offline-model-overlay"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setIsAsrModelDialogOpen(false)
+          }}
+        >
+          <section
+            className="offline-model-modal asr-model-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="asr-model-title"
+          >
+            <header className="offline-model-header">
+              <div>
+                <span className="arena-kicker">VOICE INPUT</span>
+                <h2 id="asr-model-title">Choose a speech model</h2>
+              </div>
+              <button
+                type="button"
+                className="offline-model-close"
+                aria-label="Close speech model selection"
+                onClick={() => setIsAsrModelDialogOpen(false)}
+              >×</button>
+            </header>
+            <p className="asr-model-dialog-hint">Choose which model should transcribe your recording.</p>
+            <div className="asr-model-options">
+              {asrModels.map((model) => (
+                <button
+                  type="button"
+                  className="asr-model-option"
+                  key={getId(model, ['modelId'])}
+                  onClick={() => chooseAsrModel(model)}
+                >
+                  <span className="asr-model-option-icon" aria-hidden="true">◉</span>
+                  <span className="asr-model-option-name">
+                    <strong>{getEntityName(model, 'Speech model')}</strong>
+                    <small>{model.providerDisplayName || model.providerCode || 'Speech-to-text'}</small>
+                  </span>
+                  <span className="asr-model-option-arrow" aria-hidden="true">→</span>
+                </button>
+              ))}
+            </div>
+            <footer className="offline-model-footer">
+              <button className="secondary-button" type="button" onClick={() => setIsAsrModelDialogOpen(false)}>Cancel</button>
+            </footer>
+          </section>
+        </div>
+      )}
     </main>
   )
 }
