@@ -1,11 +1,15 @@
 #root {
+  width: 100%;
   min-height: 100vh;
+  min-height: 100dvh;
+  overflow-x: hidden;
 }
 
 .auth-layout {
   display: grid;
   grid-template-columns: minmax(420px, 0.94fr) minmax(480px, 1.06fr);
   min-height: 100vh;
+  min-height: 100dvh;
   background: #fffefa;
 }
 
@@ -13,6 +17,7 @@
   position: relative;
   display: flex;
   min-height: 100vh;
+  min-height: 100dvh;
   flex-direction: column;
   justify-content: space-between;
   overflow: hidden;
@@ -501,6 +506,7 @@
   .auth-layout {
     display: block;
     min-height: 100vh;
+    min-height: 100dvh;
     background: #fffefa;
   }
 
@@ -510,6 +516,7 @@
 
   .form-panel {
     min-height: 100vh;
+    min-height: 100dvh;
     box-sizing: border-box;
     padding: 25px 24px 18px;
   }

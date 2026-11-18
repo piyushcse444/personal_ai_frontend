@@ -329,13 +329,29 @@ export default function Workspace({ onLogout }) {
     const composer = composerRef.current
     if (!composer) return
 
-    composer.style.height = 'auto'
-    const scrollHeight = composer.scrollHeight
-    const maxHeight = Number.parseFloat(window.getComputedStyle(composer).maxHeight)
-    const nextHeight = Number.isFinite(maxHeight) ? Math.min(scrollHeight, maxHeight) : scrollHeight
-    composer.style.height = `${nextHeight}px`
-    composer.style.overflowY = scrollHeight > nextHeight ? 'auto' : 'hidden'
-  }, [draft])
+    function resizeComposer() {
+      if (!isComposerExpanded) {
+        composer.style.height = '40px'
+        composer.style.overflowY = 'hidden'
+        return
+      }
+
+      composer.style.height = 'auto'
+      const scrollHeight = composer.scrollHeight
+      const maxHeight = Number.parseFloat(window.getComputedStyle(composer).maxHeight)
+      const nextHeight = Number.isFinite(maxHeight) ? Math.min(scrollHeight, maxHeight) : scrollHeight
+      composer.style.height = `${nextHeight}px`
+      composer.style.overflowY = scrollHeight > nextHeight ? 'auto' : 'hidden'
+    }
+
+    resizeComposer()
+    window.addEventListener('resize', resizeComposer)
+    window.visualViewport?.addEventListener('resize', resizeComposer)
+    return () => {
+      window.removeEventListener('resize', resizeComposer)
+      window.visualViewport?.removeEventListener('resize', resizeComposer)
+    }
+  }, [draft, isComposerExpanded])
 
   useEffect(() => () => {
     audioRecordingRequestRef.current += 1
@@ -521,6 +537,13 @@ export default function Workspace({ onLogout }) {
   ))
   const selectedModelIsOffline = selectedCatalogModel?.isOffline === true
     || (getId(selectedModel, ['modelId']) === modelId && selectedModel?.isOffline === true)
+  const headerModels = activeConversation
+    ? [activeConversation?.model, activeCatalogModel, activeDetailModel]
+    : [selectedDetailModel, selectedCatalogModel]
+  const headerModel = headerModels.find((model) => model?.displayName)
+    || headerModels.find((model) => model?.modelName)
+  const headerModelName = headerModel?.displayName || headerModel?.modelName || 'Select a model'
+  const headerModelStatus = `${headerModelName}${headerModels.some((model) => model?.isOffline === true) ? ' (Offline)' : ''}`
   const configProviderIsOffline = configProviderModels.length > 0
     && configProviderModels.every((model) => model.isOffline === true)
 
@@ -833,7 +856,7 @@ export default function Workspace({ onLogout }) {
           window.requestAnimationFrame(() => {
             const composer = composerRef.current
             if (!composer) return
-            if (composer.scrollHeight > 42) setIsComposerExpanded(true)
+            if (composer.scrollHeight > 44) setIsComposerExpanded(true)
             composer.focus()
           })
         } catch (error) {
@@ -1570,7 +1593,10 @@ export default function Workspace({ onLogout }) {
         <header className="game-topbar">
           <button className="mobile-menu-button" type="button" onClick={() => setIsMobileSidebarOpen(true)} aria-label="Open navigation">☰</button>
           <div className="breadcrumb"><span>YOUR SPACE</span><span>/</span><strong>{section === 'chat' ? 'CHAT ARENA' : section === 'providers' ? 'PROVIDER CATALOG' : section === 'configs' ? 'MY CONFIGURATIONS' : 'ACCOUNT'}</strong></div>
-          <div className="topbar-status"><span className="status-dot" /> PRIVATE WORKSPACE</div>
+          <div className="topbar-status" title={headerModelStatus}>
+            <span className="status-dot" />
+            <span className="topbar-model-name">{headerModelStatus}</span>
+          </div>
         </header>
 
         {notice && <div className={`workspace-notice ${notice.type}`} role={notice.type === 'error' ? 'alert' : 'status'}>
@@ -1581,7 +1607,7 @@ export default function Workspace({ onLogout }) {
 
         {section === 'chat' && (
           <div className="workspace-content chat-section">
-            <section className="selection-bar" aria-label="Conversation model configuration">
+            {!conversationSelectionLocked && <section className="selection-bar" aria-label="Conversation model configuration">
               <label>MODEL
                 <select value={modelId} onChange={(event) => {
                   const nextModelId = event.target.value
@@ -1611,8 +1637,8 @@ export default function Workspace({ onLogout }) {
                 ? <span className="model-lock" title="The model cannot be changed after a conversation has messages">🔒 Model locked</span>
                 : activeConversation ? <button className="secondary-button" type="button" onClick={applyConversationSelection} disabled={busy || conversationSelectionLocked || !modelId || !selectedModelIsChat || (!configId && !selectedModelIsOffline)}>Apply to conversation</button> : null}
               {selectedModel && getId(selectedModel, ['modelId']) === modelId && <span className="model-context">Context {selectedModel.contextWindow ? Number(selectedModel.contextWindow).toLocaleString() : '—'}</span>}
-            </section>
-            {renderError('modelsByProvider')}{renderError('modelDetail')}
+            </section>}
+            {!conversationSelectionLocked && <>{renderError('modelsByProvider')}{renderError('modelDetail')}</>}
             {!activeConversation ? (
               <section className="workspace-empty">
                 <div className="welcome-emblem"><span>✳</span></div>
@@ -1693,60 +1719,66 @@ export default function Workspace({ onLogout }) {
                 </section>
                 <form className="chat-composer" onSubmit={sendMessage}>
                   <div className={`chat-composer-row ${isComposerExpanded ? 'expanded' : ''}`}>
+                    <div className="composer-left">
+                        <div className="attachment-menu-wrap" ref={attachmentMenuRef}>
+                          <input
+                            ref={imageInputRef}
+                            className="image-file-input"
+                            type="file"
+                            accept="image/png,image/jpeg,image/webp"
+                            onChange={selectImage}
+                            aria-label="Choose an image"
+                          />
+                          <button
+                            className={`composer-icon-button attachment-button ${isAttachmentMenuOpen ? 'active' : ''}`}
+                            type="button"
+                            aria-label="Add attachments"
+                            aria-expanded={isAttachmentMenuOpen}
+                            title="Add attachments"
+                            onClick={() => setIsAttachmentMenuOpen((open) => !open)}
+                          >+</button>
+                          {isAttachmentMenuOpen && (
+                            <div className="attachment-menu" role="menu" aria-label="Attachments">
+                              <button
+                                type="button"
+                                role="menuitem"
+                                disabled={!supportsVision || pending || imageLoading}
+                                title={!supportsVision ? 'Image uploads require a vision-capable model.' : undefined}
+                                onClick={() => {
+                                  setIsAttachmentMenuOpen(false)
+                                  if (supportsVision) imageInputRef.current?.click()
+                                }}
+                              >
+                                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                  <rect x="3.5" y="4" width="17" height="16" rx="3" stroke="currentColor" strokeWidth="1.7" />
+                                  <circle cx="9" cy="10" r="1.7" stroke="currentColor" strokeWidth="1.5" />
+                                  <path d="m5 17 4.5-4 3.2 2.7 2.5-2 3.8 3.3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                                </svg>
+                                <span className="attachment-menu-copy">
+                                  <strong>Photos & files</strong>
+                                  <small>{supportsVision ? 'Add an image to your message' : 'Requires a vision model'}</small>
+                                </span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                    </div>
                     <textarea ref={composerRef} value={draft} onChange={(event) => {
                       const nextDraft = event.target.value
                       setDraft(nextDraft)
-                      if (nextDraft && event.currentTarget.scrollHeight > 42) setIsComposerExpanded(true)
-                      else if (!nextDraft) setIsComposerExpanded(false)
+                      if (!nextDraft.trim()) setIsComposerExpanded(false)
+                        else {
+                          event.currentTarget.style.height = 'auto'
+                          setIsComposerExpanded(event.currentTarget.scrollHeight > 44)
+                        }
                     }} onKeyDown={(event) => {
                       if (event.key === 'Enter' && !event.shiftKey) {
                         event.preventDefault()
                         event.currentTarget.form.requestSubmit()
                       }
-                    }} placeholder="Message your AI..." aria-label="Message your AI" rows={1} maxLength={2000} />
-                    <div className="composer-controls">
-                    <div className="attachment-menu-wrap" ref={attachmentMenuRef}>
-                      <input
-                        ref={imageInputRef}
-                        className="image-file-input"
-                        type="file"
-                        accept="image/png,image/jpeg,image/webp"
-                        onChange={selectImage}
-                        aria-label="Choose an image"
-                      />
-                      <button
-                        className={`composer-icon-button attachment-button ${isAttachmentMenuOpen ? 'active' : ''}`}
-                        type="button"
-                        aria-label="Add attachments"
-                        aria-expanded={isAttachmentMenuOpen}
-                        title="Add attachments"
-                        onClick={() => setIsAttachmentMenuOpen((open) => !open)}
-                      >+</button>
-                      {isAttachmentMenuOpen && (
-                        <div className="attachment-menu" role="menu" aria-label="Attachments">
-                          <button
-                            type="button"
-                            role="menuitem"
-                            disabled={!supportsVision || pending || imageLoading}
-                            title={!supportsVision ? 'Image uploads require a vision-capable model.' : undefined}
-                            onClick={() => {
-                              setIsAttachmentMenuOpen(false)
-                              if (supportsVision) imageInputRef.current?.click()
-                            }}
-                          >
-                            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                              <rect x="3.5" y="4" width="17" height="16" rx="3" stroke="currentColor" strokeWidth="1.7" />
-                              <circle cx="9" cy="10" r="1.7" stroke="currentColor" strokeWidth="1.5" />
-                              <path d="m5 17 4.5-4 3.2 2.7 2.5-2 3.8 3.3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-                            </svg>
-                            <span className="attachment-menu-copy">
-                              <strong>Photos & files</strong>
-                              <small>{supportsVision ? 'Add an image to your message' : 'Requires a vision model'}</small>
-                            </span>
-                          </button>
-                        </div>
-                      )}
-                    </div>
+                    }} placeholder="Message ChatGPT..." aria-label="Message your AI" rows={1} maxLength={2000} />
+                    <div className="composer-actions">
+                      <div className="composer-right">
                     <button
                       className={`composer-icon-button thinking-control ${thinkingEnabled ? 'active' : ''}`}
                       type="button"
@@ -1798,6 +1830,7 @@ export default function Workspace({ onLogout }) {
                     {pending
                       ? <button type="button" className="send-button stop-button" onClick={cancelStream} aria-label="Stop response">■</button>
                       : <button type="submit" className="send-button" disabled={(!draft.trim() && !selectedImage) || busy || imageLoading} aria-label="Send message">↑</button>}
+                      </div>
                     </div>
                   </div>
                   {selectedImage && (
